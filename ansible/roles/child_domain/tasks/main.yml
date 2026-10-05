@@ -9,6 +9,19 @@
       - "{{hostvars[dns_domain].ansible_host}}"
     log_path: C:\dns_log.txt
 
+# The NAT adapter keeps the hypervisor's resolvers, which don't know the parent domain, and
+# Windows may ask that adapter first: dcpromo then fails with 8524 (DNS lookup failure). Point
+# it at the parent DC too: the domain is the lab's only DNS from then on.
+- name: "point the {{nat_adapter}} interface's DNS at the parent DC"
+  ansible.windows.win_dns_client:
+    adapter_names: "{{nat_adapter}}"
+    ipv4_addresses:
+      - "{{hostvars[dns_domain].ansible_host}}"
+  when: two_adapters
+
+- name: flush the DNS cache
+  ansible.windows.win_shell: Clear-DnsClientCache
+
 - name: Install windows features - AD Domain Services
   win_feature:
     name: AD-Domain-Services
@@ -53,10 +66,12 @@
           [String]
           $DomSafePassword
       )
+      # Any failure to read the domain (not found, or no AD Web Services answering yet) means
+      # it doesn't exist from here: only a successful read skips the promotion.
       try {
-          $child_domain = Get-ADDomain -Identity $NewDomainName
+          $child_domain = Get-ADDomain -Identity $NewDomainName -ErrorAction Stop
           $domainExist=$true
-      } catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
+      } catch {
           $domainExist=$false
       }
       if (-not $domainExist) {
@@ -64,7 +79,18 @@
         $pass = ConvertTo-SecureString $Password -AsPlainText -Force
         $Cred = New-Object System.Management.Automation.PSCredential ($DomainAdmin, $pass)
         $safePassword = ConvertTo-SecureString $DomSafePassword -AsPlainText -Force
-        Install-ADDSDomain -Credential $Cred -SkipPreChecks -NewDomainName $NewDomainName -NewDomainNetbiosName $NewDomainNetbiosName -ParentDomainName $ParentDomainName -ReplicationSourceDC $ReplicationSourceDC -DatabasePath "C:\Windows\NTDS" -SYSVOLPath "C:\Windows\SYSVOL" -LogPath "C:\Windows\Logs" -SafeModeAdministratorPassword $safePassword -Force -NoRebootOnCompletion
+        # A failed earlier attempt leaves its database behind, which the next one refuses
+        # ("the database has been replaced"): not a DC yet, so nothing there is in use.
+        if ((Get-CimInstance Win32_ComputerSystem).DomainRole -lt 4) {
+          foreach ($d in "C:\Windows\NTDS", "C:\Windows\SYSVOL") {
+            if (Test-Path $d) { Remove-Item -Recurse -Force $d }
+          }
+          # Its transaction logs too (LogPath below), not the rest of C:\Windows\Logs.
+          Remove-Item C:\Windows\Logs\edb*, C:\Windows\Logs\res*.jrs -Force -ErrorAction SilentlyContinue
+        }
+        $result = Install-ADDSDomain -Credential $Cred -SkipPreChecks -NewDomainName $NewDomainName -NewDomainNetbiosName $NewDomainNetbiosName -ParentDomainName $ParentDomainName -ReplicationSourceDC $ReplicationSourceDC -DatabasePath "C:\Windows\NTDS" -SYSVOLPath "C:\Windows\SYSVOL" -LogPath "C:\Windows\Logs" -SafeModeAdministratorPassword $safePassword -Force -NoRebootOnCompletion
+        # Install-ADDSDomain reports a failed promotion in its result instead of throwing.
+        if ($result.Status -ne "Success") { throw "child domain promotion failed: $($result.Message)" }
       } else {
         $Ansible.Changed = $false
       }
